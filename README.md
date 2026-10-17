@@ -1108,6 +1108,457 @@ The priority is to establish a correct and testable core before introducing addi
 
 ---
 
+---
+
+# Phase 2 — Memory Formation & JEV Decision Layer
+
+## Overview
+
+Phase 2 introduces the memory formation pipeline and the Judgment, Evaluation, and Validation (JEV) decision layer.
+
+The objective of this phase is to transform incoming experiences into structured candidate memories and evaluate how those candidates should be handled before they affect the canonical memory system.
+
+Phase 2 builds on the Memory Kernel implemented in Phase 1. It introduces experience ingestion, candidate memory formation, deterministic decision rules, and an adapter for integrating the TypeSafe decision API.
+
+The Memory Kernel remains the canonical source of truth. The JEV layer evaluates candidates but does not independently mutate persistent memory.
+
+### Objectives
+
+- Ingest and validate incoming experiences.
+- Normalize incoming text while preserving source information.
+- Convert experiences into structured candidate memories.
+- Preserve provenance between experiences and candidate memories.
+- Evaluate candidates using deterministic JEV rules.
+- Support provider-backed decision evaluation through TypeSafe.
+- Validate decisions before they can influence the canonical memory system.
+- Maintain compatibility with the Phase 1 Memory Kernel.
+- Test normal operation, invalid inputs, decision mapping, and provider failures.
+
+---
+
+## Architecture
+
+```text
+                 Incoming Experience
+                         |
+                         v
+                Experience Ingestor
+                         |
+                         v
+                    MemoryEvent
+                         |
+                         v
+                  CandidateBuilder
+                         |
+                         v
+                  CandidateMemory
+                         |
+                         v
+                  JEV Decision Layer
+                         |
+                +--------+--------+
+                |                 |
+                v                 v
+        Deterministic JEV    TypeSafe Adapter
+                |                 |
+                +--------+--------+
+                         |
+                         v
+                   JEVDecision
+                         |
+                         v
+                Validation Boundary
+                         |
+                         v
+                  Memory Kernel
+```
+
+**Important:** The diagram represents the intended flow and integration boundary. The presence of a decision action does not mean that every action already has an execution handler.
+
+The TypeSafe adapter translates provider responses into internal decisions. It does not directly modify canonical memories.
+
+---
+
+## 1. Experience Ingestion
+
+### Component
+
+`src/memory_engine/formation/ingestion.py`
+
+The experience ingestion component converts incoming experience data into structured `MemoryEvent` objects.
+
+### Responsibilities
+
+- Validate required input fields.
+- Reject invalid or empty textual inputs.
+- Normalize whitespace in incoming content.
+- Generate unique event identifiers.
+- Maintain timezone-aware event timestamps.
+- Preserve source, scope, and metadata.
+- Produce structured events for downstream memory formation.
+
+### MemoryEvent
+
+The ingestion layer uses the following conceptual fields:
+
+| Field | Purpose |
+|---|---|
+| `event_id` | Unique identifier for the experience event |
+| `content` | Normalized experience content |
+| `source` | Origin of the experience |
+| `occurred_at` | Time associated with the experience |
+| `scope` | Context or scope associated with the event |
+| `metadata` | Additional event information |
+
+The event serves as the provenance-bearing input to the candidate formation pipeline.
+
+---
+
+## 2. Candidate Memory Formation
+
+### Component
+
+`src/memory_engine/formation/candidate.py`
+
+The candidate formation component converts a `MemoryEvent` into a structured `CandidateMemory`.
+
+A candidate represents a possible memory that can be evaluated before being accepted into the canonical memory system.
+
+### Responsibilities
+
+- Construct candidate memories from ingested events.
+- Associate each candidate with its source event.
+- Preserve source and scope information.
+- Assign a memory type.
+- Carry importance and confidence scores.
+- Preserve event provenance in candidate metadata.
+- Validate score ranges and source references.
+
+### CandidateMemory
+
+| Field | Purpose |
+|---|---|
+| `content` | Candidate memory content |
+| `memory_type` | Classification of the candidate |
+| `source_event_id` | Identifier of the originating experience |
+| `source` | Origin of the experience |
+| `scope` | Scope in which the candidate applies |
+| `importance` | Estimated importance, between 0 and 1 |
+| `confidence` | Estimated confidence, between 0 and 1 |
+| `metadata` | Additional information and provenance |
+
+### Supported memory types
+
+Candidate formation uses the memory types defined by the Memory Kernel:
+
+- `EPISODIC`
+- `SEMANTIC`
+- `PROCEDURAL`
+- `PREFERENCE`
+- `TEMPORAL`
+
+The candidate builder accepts a memory type and initializes the candidate with the supplied importance and confidence values.
+
+Candidate formation does not itself persist the candidate as a canonical memory.
+
+---
+
+## 3. JEV Decision Layer
+
+### Component
+
+`src/memory_engine/decision/jev.py`
+
+The JEV component evaluates candidate memories and produces structured decisions.
+
+Its purpose is to separate memory evaluation from memory mutation.
+
+### Decision contract
+
+The internal decision model includes:
+
+| Field | Purpose |
+|---|---|
+| `action` | Proposed action for the candidate |
+| `reason` | Explanation for the decision |
+| `matched_memory_id` | Optional identifier of a matched memory |
+| `target_memory_ids` | Identifiers of explicitly selected target memories |
+| `confidence` | Confidence associated with the decision |
+| `requires_review` | Indicates whether review is required |
+| `metadata` | Additional decision information |
+
+The decision model validates important constraints, including nonempty reasons, valid confidence ranges, and consistency between matched-memory and target identifiers.
+
+### Supported decision actions
+
+The decision contract defines the following actions:
+
+| Action | Intended meaning |
+|---|---|
+| `STORE` | Store a new memory |
+| `IGNORE` | Ignore a redundant or irrelevant candidate |
+| `UPDATE` | Update an existing memory |
+| `MERGE` | Combine compatible memories |
+| `SUPERSEDE` | Replace an older memory with newer information |
+| `REINFORCE` | Strengthen an existing memory using additional evidence |
+| `CONFLICT` | Identify conflicting information |
+| `CREATE_RELATION` | Propose a relationship between memories |
+| `UNCERTAIN` | Indicate insufficient confidence |
+| `ESCALATE` | Request additional review or intervention |
+| `ARCHIVE` | Propose archiving a memory |
+| `DECAY` | Propose reducing a memory's importance over time |
+
+**Implementation status:** These values define the decision vocabulary; they do not imply that all actions have been implemented end to end. In particular, `ARCHIVE` and `DECAY` belong to the planned memory evolution functionality.
+
+### Deterministic decision rules
+
+The deterministic JEV implementation currently supports the following rules:
+
+1. **Low-confidence candidate**
+
+   If candidate confidence is below `0.3`, return `UNCERTAIN`.
+
+2. **Exact duplicate detection**
+
+   Normalize candidate and existing memory content before comparing them.
+
+   If an active memory has matching normalized content within the same scope, return `IGNORE`.
+
+3. **New candidate**
+
+   If neither of the preceding conditions applies, return `STORE`.
+
+The deterministic evaluator does not mutate existing memories.
+
+These rules provide a predictable baseline against which provider-backed decisions can be evaluated.
+
+---
+
+## 4. TypeSafe JEV Adapter
+
+### Component
+
+`src/memory_engine/decision/typesafe_adapter.py`
+
+The TypeSafe adapter connects the internal JEV contract to the TypeSafe decision API.
+
+It translates structured provider responses into the application's internal `JEVDecision` representation.
+
+### Responsibilities
+
+- Submit candidate and existing-memory context for evaluation.
+- Request a proposed action.
+- Obtain a qualitative confidence assessment.
+- Obtain a review requirement assessment.
+- Map provider action labels to internal `JEVAction` values.
+- Convert qualitative confidence labels into numeric confidence values.
+- Attach provider information to decision metadata.
+- Return an `UNCERTAIN` decision for unsupported actions.
+- Require review for risky decisions where appropriate.
+- Preserve provider failures instead of silently treating them as successful decisions.
+
+### Confidence mapping
+
+The adapter maps qualitative confidence labels to internal numeric values:
+
+| Provider confidence | Internal confidence |
+|---|---:|
+| Weak | 0.35 |
+| Moderate | 0.65 |
+| Strong | 0.90 |
+| Unrecognized label | 0.50 |
+
+These are application-level mappings, not calibrated probabilities.
+
+### Handling unsupported actions
+
+An action that cannot be mapped to the internal decision contract must not be treated as a valid memory operation.
+
+The adapter returns an `UNCERTAIN` decision and requires review when the provider proposes an unsupported action.
+
+### Handling risky decisions
+
+Actions such as `UPDATE`, `MERGE`, `SUPERSEDE`, `REINFORCE`, `CONFLICT`, and `CREATE_RELATION` may require target selection and additional validation.
+
+The adapter can flag the need for target selection, but that flag alone does not identify a valid target or authorize a mutation.
+
+Before implementing these operations, the system must validate:
+
+- Target memory identifiers.
+- Target existence and scope.
+- Current memory versions.
+- Applicable lifecycle constraints.
+- Evidence and provenance.
+- The preconditions for the requested operation.
+
+### Error handling
+
+Provider failures must remain distinguishable from successful decisions.
+
+The adapter must not silently convert a failed API request into a `STORE` decision. The calling layer is responsible for handling provider errors safely.
+
+---
+
+## 5. Integration with the Memory Kernel
+
+Phase 2 reuses the canonical memory model and manager established in Phase 1.
+
+The integration preserves the distinction between proposing an operation and executing it.
+
+### Integration principles
+
+1. Candidate formation does not automatically create a canonical memory.
+2. JEV evaluates candidates without directly mutating existing memories.
+3. A decision is not authorization to execute an operation.
+4. The Memory Kernel remains responsible for canonical memory state and lifecycle.
+5. Operations affecting existing memories must respect version checks and lifecycle rules.
+6. Evidence and provenance must remain traceable throughout the pipeline.
+
+The Phase 1 memory manager provides the canonical memory operations, including creation, retrieval, updating, superseding, and archiving.
+
+Phase 2 establishes the upstream ingestion and evaluation components that can feed a future validated execution layer.
+
+---
+
+## 6. Project Structure
+
+The Phase 2 implementation is organized into the following modules:
+
+```text
+src/memory_engine/
+├── kernel/
+│   ├── __init__.py
+│   ├── events.py
+│   ├── identity.py
+│   ├── ids.py
+│   ├── lifecycle.py
+│   ├── manager.py
+│   └── models.py
+│
+├── formation/
+│   ├── __init__.py
+│   ├── ingestion.py
+│   └── candidate.py
+│
+└── decision/
+    ├── __init__.py
+    ├── jev.py
+    └── typesafe_adapter.py
+
+tests/
+└── phase2/
+    ├── test_ingestion.py
+    ├── test_candidate_formation.py
+    ├── test_jev.py
+    └── test_phase2_compatibility.py
+
+scripts/
+├── test_api_keys.py
+└── test_jev_api.py
+```
+
+The structure above describes the expected Phase 2 modules and test files. Retain only paths that exist in your repository; the Phase 1 filenames shown here may differ from your actual layout.
+
+---
+
+## 7. Testing and Validation
+
+Phase 2 uses four dedicated test files. The compatibility tests are included within these files rather than being placed in a separate fifth test file.
+
+### Test coverage
+
+| Test file | Purpose |
+|---|---|
+| `test_ingestion.py` | Ingestion validation, normalization, and event construction |
+| `test_candidate_formation.py` | Candidate creation, provenance, and validation |
+| `test_jev.py` | Deterministic decisions and TypeSafe adapter behavior |
+| `test_phase2_compatibility.py` | Compatibility with the Phase 1 Memory Kernel |
+
+The adapter tests cover:
+
+- Mapping a supported `STORE` response.
+- Mapping a `SUPERSEDE` response and requiring review.
+- Rejecting an unsupported action.
+- Propagating provider errors.
+
+### Test results
+
+**Latest reported results:**
+
+| Test suite | Result |
+|---|---:|
+| Phase 2 tests | 23 passed |
+| Complete test suite | 40 passed |
+| Failures | 0 |
+
+Run the tests using:
+
+```bash
+# Run Phase 2 tests
+python -m pytest tests/phase2 -v
+
+# Run the complete test suite
+python -m pytest -v
+
+# Compile the memory engine
+python -m compileall -q src/memory_engine
+
+# Check tracked-file whitespace errors
+git diff --check
+```
+
+The test results above reflect the latest results reported during development. Rerun the commands after subsequent code changes to confirm the current state.
+
+---
+
+## 8. Current Phase 2 Status
+
+### Implemented
+
+- Experience ingestion and input validation.
+- Structured `MemoryEvent` creation.
+- Candidate memory formation.
+- Candidate provenance preservation.
+- Importance and confidence validation.
+- Deterministic JEV decision rules.
+- Structured JEV decision contracts.
+- TypeSafe adapter and decision mapping.
+- Unsupported-action handling.
+- Provider-error propagation.
+- Compatibility tests for the Memory Kernel.
+- Four Phase 2 test files.
+
+### Remaining work
+
+The following should not be considered complete solely because the decision contract defines the corresponding action:
+
+- Validated execution of all mutation actions.
+- Target selection and validation for existing-memory operations.
+- End-to-end handling of `UPDATE`, `MERGE`, `SUPERSEDE`, and `REINFORCE`.
+- Conflict resolution and relationship creation.
+- A complete escalation and review workflow.
+- Integration of `ARCHIVE` and `DECAY` with the future memory evolution system.
+- Persistent vector and graph storage, which belongs to Phase 3.
+
+---
+
+## 9. Next Phase
+
+### Phase 3 — Persistent Memory Storage
+
+Phase 3 will introduce persistent storage and retrieval while preserving the Memory Kernel as the canonical source of truth.
+
+The planned storage components are:
+
+- **Qdrant:** Vector storage and semantic similarity retrieval.
+- **FalkorDB:** Graph storage for entities and relationships.
+- **Object/evidence storage:** Preservation of raw evidence.
+- **Memory Kernel:** Canonical memory identity, content, lifecycle, and versioning.
+
+Vector and graph representations will be derived from canonical memory rather than becoming independent sources of truth.
+
+The subsequent Dream Engine phase will focus on offline memory consolidation and evolution, including the review and lifecycle operations that are not yet implemented by the Phase 2 decision layer.
+
 ## Development Philosophy
 
 The project follows several architectural principles:

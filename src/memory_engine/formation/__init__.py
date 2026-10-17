@@ -1,0 +1,1 @@
+"""Memory formation from raw experiences into structured candidates."""
