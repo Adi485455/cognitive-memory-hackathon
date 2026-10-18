@@ -1799,6 +1799,606 @@ The JSON-backed storage components remain available as an alternative implementa
 
 This phase does not, by itself, establish that every storage component is connected to an external vector database or graph database. Those integrations should be documented when implemented and tested.
 
+
+## Phase 4: Dream Engine — Memory Evolution
+
+Phase 4 introduces the Dream Engine, an offline memory consolidation
+workflow that examines existing memories, discovers potential
+relationships and conflicts, and generates structured consolidation
+decisions for review.
+
+The Dream Engine builds on the canonical memory architecture established
+in Phases 1–3. It does not independently modify canonical memories.
+Instead, it produces reviewable proposals that can be validated by the
+memory management system.
+
+### Architecture
+
+The Dream Engine consists of the following components:
+
+- **Dream Models:** Represent dreaming jobs, their lifecycle states,
+  execution results, timestamps, retry attempts, and errors.
+
+- **Dream Configuration:** Defines processing limits for memories,
+  relationships, duplicate candidates, conflict candidates, and job
+  retries.
+
+- **Persistent Job Queue:** Uses SQLite to persist dreaming jobs,
+  deduplicate jobs based on trigger events, and atomically claim pending
+  jobs for execution.
+
+- **Candidate Selector:** Selects active memories for processing,
+  optionally restricting selection to specified target memory IDs.
+  Selection is deterministic and bounded by the configured limits.
+
+- **Memory Discovery Engine:** Examines selected memories to identify
+  potential duplicates, relationships, and conflicts. Candidate
+  generation is bounded by configuration limits.
+
+- **Consolidation Decision Engine:** Converts discovery candidates into
+  structured JEV decisions, including MERGE, CREATE_RELATION, CONFLICT,
+  and UNCERTAIN actions. Decisions requiring further validation are
+  marked for review.
+
+- **Dream Orchestrator:** Coordinates job execution, candidate
+  selection, discovery, consolidation, result creation, and job
+  lifecycle management.
+
+- **Persistent Result Store:** Stores execution reports in SQLite,
+  allowing previously completed reports to be retrieved after the
+  application restarts.
+
+- **Serialization Layer:** Converts execution results, discovery
+  candidates, and consolidation decisions into JSON-compatible
+  representations and reconstructs their typed models when retrieved.
+
+### Dreaming Workflow
+
+1. A dreaming job is submitted to the persistent queue.
+2. The orchestrator claims a pending job and transitions it to RUNNING.
+3. The candidate selector identifies eligible memories.
+4. The discovery engine identifies potential duplicates, relationships,
+   and conflicts.
+5. The consolidation engine evaluates candidates and generates
+   structured JEV decisions.
+6. A DreamResult summarizes the execution, including examined memories,
+   candidate counts, warnings, and mutation counts.
+7. The execution report is serialized and persisted when a result store
+   is configured.
+8. The job is marked COMPLETED and the execution report is returned.
+
+If execution fails, the orchestrator records the error and requeues the
+job while retry attempts remain. Once the configured attempt limit is
+reached, the job remains FAILED.
+
+### Persistence
+
+Phase 4 introduces two SQLite-backed persistence components:
+
+- **DreamQueue:** Stores job state, execution metadata, retry attempts,
+  and errors.
+- **DreamResultStore:** Stores serialized execution reports, including
+  DreamResult, DiscoveryResult, and ConsolidationResult data.
+
+The result store rejects conflicting writes for an existing job ID
+rather than silently replacing the previously stored report.
+
+The queue and result store use separate SQLite transactions. Consequently,
+updates across both stores are not atomic, and recovery from a process
+crash between the two writes remains a limitation.
+
+### Safety and Consistency
+
+The Dream Engine separates discovery and decision-making from canonical
+memory mutation.
+
+- Discovery produces candidate relationships, duplicates, and conflicts.
+- Consolidation produces structured decisions for review.
+- Proposed decisions do not automatically modify canonical memories.
+- Execution results report zero applied mutations in the current
+  orchestrator implementation.
+- Configurable limits bound candidate processing and retry attempts.
+
+The current discovery implementation uses deterministic similarity,
+shared-entity, and heuristic conflict detection. It should not be
+interpreted as a complete semantic contradiction-detection system.
+
+### Testing
+
+Phase 4 tests cover:
+
+- Dream models and configuration validation.
+- Job lifecycle and retry behavior.
+- Persistent queue operations.
+- Candidate selection and discovery.
+- Consolidation decisions and review requirements.
+- Orchestrator execution and canonical-memory safety.
+- Result-store persistence and retrieval.
+- Serialization and deserialization of execution reports.
+- Compatibility with the existing memory architecture.
+
+Run the Phase 4 tests:
+
+```bash
+pytest -q tests/phase4
+
+
+---
+
+## Phase 5: Agent Integration, Deployment & Evaluation
+
+### Overview
+
+Phase 5 transforms the Cognitive Memory Engine from a collection of memory subsystems into an agent-usable, persistent, and testable memory service.
+
+It introduces a versioned REST API, a Memory Orchestrator that coordinates experience ingestion and memory formation, persistent memory lifecycle operations, and integration tests that verify the new functionality alongside the existing architecture.
+
+The goal is to make the memory system accessible to LLM agents through a consistent interface while preserving canonical memory state, evidence provenance, version history, and conservative decision-making.
+
+### Objectives
+
+- Expose canonical memory operations through a versioned REST API.
+- Coordinate experience ingestion, candidate formation, decision-making, and persistence.
+- Preserve evidence provenance when creating canonical memories.
+- Support memory retrieval, listing, updates, and lifecycle history.
+- Prevent stale updates through optimistic version control.
+- Avoid automatically storing low-confidence or duplicate experiences.
+- Maintain compatibility with the existing Phases 1–4 architecture.
+- Establish a foundation for deployment, observability, and reproducible evaluation.
+
+### Architecture
+
+The Phase 5 request flow is:
+
+```text
+User / LLM Agent
+       |
+       v
+Versioned Memory API
+       |
+       +-----------------------------+
+       |                             |
+       v                             v
+Canonical Memory Operations    Experience Ingestion
+       |                             |
+       v                             v
+Persistent Memory Service      Candidate Formation
+       |                             |
+       v                             v
+SQLite Memory Repository       JEV Decision Engine
+       |                             |
+       v                             +--------------------+
+Canonical Memory State          |          |             |
+       |                      STORE      IGNORE       UNCERTAIN
+       v                        |          |             |
+Domain Event History            v          v             v
+                              Evidence   No New       Review
+                              Registry   Memory       Required
+                                 |
+                                 v
+                             Object Store
+```
+
+The existing kernel, memory lifecycle, ingestion, candidate formation, decision, and evidence-storage components remain the foundation of the system. Phase 5 coordinates these components through an API and orchestration layer.
+
+### 1. Versioned REST API
+
+The API is implemented using FastAPI and exposes versioned endpoints under `/v1`.
+
+The service also provides a health endpoint for checking API availability.
+
+#### Health Check
+
+```http
+GET /health
+```
+
+Example response:
+
+```json
+{
+  "status": "ok",
+  "service": "cognitive-memory-engine",
+  "api_version": "v1"
+}
+```
+
+#### Create a Canonical Memory
+
+```http
+POST /v1/memories
+Content-Type: application/json
+```
+
+Example request:
+
+```json
+{
+  "content": "The user prefers C++ for DSA practice.",
+  "memory_type": "preference",
+  "source": "conversation",
+  "scope": "user",
+  "importance": 0.8,
+  "confidence": 0.9,
+  "metadata": {
+    "origin": "example"
+  }
+}
+```
+
+The endpoint registers evidence, constructs a canonical memory, and persists it through the memory service.
+
+A successful creation returns HTTP `201 Created` and a serialized memory representation containing its identifier, content, type, evidence references, version, timestamps, confidence, importance, scope, status, and metadata.
+
+#### List Canonical Memories
+
+```http
+GET /v1/memories
+```
+
+Returns the canonical memories available through the configured memory service.
+
+The response includes an `items` collection and a `count` field.
+
+#### Retrieve a Memory
+
+```http
+GET /v1/memories/{memory_id}
+```
+
+Retrieves a canonical memory using its identifier.
+
+The endpoint returns:
+- HTTP `200 OK` when the memory exists.
+- HTTP `400 Bad Request` when the identifier is invalid.
+- HTTP `404 Not Found` when the memory does not exist.
+
+#### Update a Memory
+
+```http
+PATCH /v1/memories/{memory_id}
+Content-Type: application/json
+```
+
+Example request:
+
+```json
+{
+  "expected_version": 1,
+  "content": "The user prefers C++ for advanced DSA practice.",
+  "importance": 0.85,
+  "confidence": 0.95,
+  "metadata": {
+    "updated_by": "agent"
+  }
+}
+```
+
+Updates use optimistic version control. The caller supplies the version it expects to modify.
+
+If the current version differs from `expected_version`, the update is rejected with HTTP `409 Conflict`. This prevents a caller from silently overwriting a newer memory version.
+
+The API also validates memory identifiers and reports missing memories.
+
+#### Retrieve Memory History
+
+```http
+GET /v1/memories/{memory_id}/history
+```
+
+Returns the durable domain events associated with a memory.
+
+Each event includes:
+- Event identifier.
+- Event type.
+- Memory version.
+- Event timestamp.
+- Operation identifier, when available.
+- Event metadata.
+
+This endpoint exposes the recorded lifecycle history without requiring the caller to access the underlying repository directly.
+
+### 2. Memory Orchestrator
+
+The `MemoryOrchestrator` coordinates the process of turning incoming experiences into canonical memories.
+
+Its processing pipeline is:
+
+```text
+Incoming Experience
+        |
+        v
+Experience Ingestor
+        |
+        v
+Candidate Builder
+        |
+        v
+JEV Decision Engine
+        |
+        +-----------------------------+
+        |              |              |
+        v              v              v
+      STORE          IGNORE        UNCERTAIN
+        |              |              |
+        v              v              v
+ Register Evidence  No New Memory  Require Review
+        |
+        v
+ Construct Canonical Memory
+        |
+        v
+ Persistent Memory Service
+        |
+        v
+ Memory Repository + Domain Events
+```
+
+The orchestrator uses the existing formation and decision components rather than independently reimplementing their responsibilities.
+
+#### Experience Processing
+
+The orchestrator accepts:
+- Experience content.
+- Source.
+- Scope.
+- Memory type.
+- Importance.
+- Confidence.
+- Metadata.
+
+It then ingests the experience, builds a candidate memory, retrieves existing memories in the candidate's scope, and asks the JEV decision engine to evaluate the candidate.
+
+Only candidates that receive a `STORE` decision and do not require review proceed to canonical storage.
+
+#### Decision Handling
+
+The current JEV implementation supports conservative, deterministic handling of low-confidence candidates and exact duplicates.
+
+| Condition | Decision | Behavior |
+|---|---|---|
+| No equivalent active memory exists | `STORE` | Register evidence and create a canonical memory |
+| Equivalent active memory exists in the same scope | `IGNORE` | Avoid creating another canonical memory |
+| Candidate confidence is below `0.3` | `UNCERTAIN` | Require review without automatic storage |
+
+Duplicate detection normalizes case and whitespace before comparing content.
+
+Only active memories within the same scope participate in the duplicate check. Equivalent content in different scopes can therefore be stored separately.
+
+The JEV decision contract also defines additional actions, including update, merge, supersede, reinforce, conflict, and escalation. Defining an action does not mean that every action is automatically executed by the current orchestrator.
+
+#### Evidence Provenance
+
+For experiences approved for storage, the orchestrator registers evidence before constructing the canonical memory.
+
+The resulting memory references the registered evidence identifier. Its metadata preserves relevant source information, including the source event identifier and evidence content hash.
+
+This connects the canonical memory to the evidence supporting it.
+
+### 3. Persistent Memory Lifecycle
+
+Phase 5 exposes the existing persistent memory service through the API and orchestrator.
+
+The service supports:
+- Creating canonical memories.
+- Retrieving individual memories.
+- Listing memories.
+- Updating memories with expected-version validation.
+- Superseding memories.
+- Archiving memories.
+- Retrieving domain event history.
+
+SQLite-backed persistence stores canonical memory records and domain events. Memory mutations and their corresponding events are written transactionally by the SQLite repository.
+
+The service also retains support for the existing non-SQLite repository path.
+
+#### Optimistic Version Control
+
+Each canonical memory has a version number.
+
+For example:
+
+```text
+Initial memory: Version 1
+       |
+       v
+Update with expected_version = 1
+       |
+       v
+Updated memory: Version 2
+       |
+       v
+Another update with expected_version = 1
+       |
+       v
+Rejected: Version Conflict
+```
+
+This mechanism protects against stale writes and makes version transitions observable through domain events.
+
+### 4. Configuration and Local Execution
+
+The API uses a configurable local data directory.
+
+The `MEMORY_DATA_DIR` environment variable determines the directory used by the default API dependencies. If it is not provided, the default directory is `.memory_data`.
+
+The default SQLite database is created at:
+
+```text
+.memory_data/memories.sqlite3
+```
+
+Evidence metadata and stored objects use separate directories under the same data directory.
+
+#### Install Dependencies
+
+Ensure that the project environment is activated:
+
+```bash
+source .venv/bin/activate
+```
+
+Install the project and its dependencies according to the existing project configuration. The Phase 5 API requires FastAPI, Uvicorn, and Pydantic.
+
+#### Configure Local Storage
+
+To use a dedicated data directory:
+
+```bash
+export MEMORY_DATA_DIR="./.memory_data"
+```
+
+The default dependencies create the required directory structure as needed.
+
+The `.memory_data/` directory contains runtime data and should not be committed to Git.
+
+#### Start the API
+
+Run the API from the project root:
+
+```bash
+uvicorn memory_engine.api.app:app --reload
+```
+
+The interactive API documentation is available at:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+The OpenAPI schema is available at:
+
+```text
+http://127.0.0.1:8000/openapi.json
+```
+
+Check the health endpoint:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+These commands describe the local development setup. A production deployment still requires appropriate process management, security controls, and operational configuration.
+
+### 5. Testing and Compatibility
+
+Phase 5 introduces four dedicated test files:
+
+```text
+tests/phase5/
+├── test_api_endpoints.py
+├── test_memory_lifecycle.py
+├── test_orchestrator.py
+└── test_phase5_compatibility.py
+```
+
+The tests cover the following areas.
+
+#### API Endpoint Tests
+
+- Health endpoint behavior.
+- Canonical memory creation and retrieval.
+- Listing memories.
+- Request validation.
+- Invalid memory identifiers.
+- Missing memory handling.
+- Memory history retrieval.
+
+#### Memory Lifecycle Tests
+
+- Initial memory version.
+- Version increments after updates.
+- Evidence ID preservation.
+- Rejection of stale updates.
+- Durable creation and update events.
+- Archive transitions.
+- Supersede transitions.
+- Missing memory handling.
+
+#### Orchestrator Tests
+
+- Successful experience processing.
+- Canonical memory creation.
+- Evidence provenance.
+- Duplicate detection.
+- Case and whitespace normalization.
+- Low-confidence review handling.
+- Confidence threshold behavior.
+- Scope isolation.
+
+#### Compatibility Tests
+
+- Integration with the existing ingestion, candidate formation, and JEV components.
+- Persistence of canonical memory state and event history.
+- API integration with the memory service and evidence registry.
+- Prevention of automatic canonical storage for uncertain candidates.
+- Continued importability of the Phase 4 Dream Engine.
+
+#### Run the Phase 5 Tests
+
+```bash
+pytest -q tests/phase5/
+```
+
+#### Run the Complete Test Suite
+
+```bash
+pytest -q
+```
+
+At the time of the current Phase 5 implementation, the test suite reported:
+
+```text
+Phase 5: 28 passed
+Complete project suite: 158 passed
+```
+
+These results describe the recorded development test run. Rerun the commands after subsequent changes to confirm the current repository state.
+
+### 6. Operational Considerations and Limitations
+
+Phase 5 provides a foundation for using the Cognitive Memory Engine from agents and applications. Some production concerns remain separate from the functionality verified by the current tests.
+
+#### Concurrency
+
+Duplicate detection occurs before canonical storage. The check and subsequent creation are not an atomic operation across concurrent orchestrator requests.
+
+Concurrent requests containing equivalent experiences may therefore require additional synchronization or idempotency controls to guarantee duplicate prevention.
+
+#### Evidence and Memory Transactions
+
+The evidence registry and canonical memory repository use separate storage mechanisms. Registering evidence and persisting a canonical memory are not one distributed transaction.
+
+Failure handling and recovery across these storage boundaries require additional safeguards before the system can guarantee complete cross-store consistency.
+
+#### Authentication and Authorization
+
+The API currently provides the implemented memory operations without a complete authentication and authorization layer.
+
+A production deployment should introduce appropriate identity, access control, and scope enforcement.
+
+#### Observability
+
+The health endpoint confirms that the API process can respond to requests. It is not a comprehensive readiness check for every storage dependency.
+
+Production observability should include structured application logs, error reporting, storage health checks, and relevant operational metrics.
+
+#### Reproducible Evaluation
+
+The Phase 5 tests provide repeatable checks of API behavior, lifecycle operations, orchestration decisions, and compatibility.
+
+A broader evaluation framework should additionally measure memory retrieval quality, decision accuracy, duplicate handling under concurrency, latency, resource consumption, and recovery behavior using reproducible datasets and evaluation procedures.
+
+### Phase 5 Outcome
+
+Phase 5 connects the existing cognitive memory architecture to a versioned API and an orchestration layer suitable for agent integration.
+
+It establishes tested pathways for memory creation, retrieval, updating, lifecycle transitions, evidence provenance, event history, and conservative decision-making.
+
+Together with the kernel, memory formation, persistent storage, and Dream Engine introduced in Phases 1–4, this phase provides a foundation for further agent integration, deployment hardening, and systematic evaluation.
+
+---
+
 ## Development Philosophy
 
 The project follows several architectural principles:
