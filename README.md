@@ -1559,6 +1559,246 @@ Vector and graph representations will be derived from canonical memory rather th
 
 The subsequent Dream Engine phase will focus on offline memory consolidation and evolution, including the review and lifecycle operations that are not yet implemented by the Phase 2 decision layer.
 
+
+---
+
+# Phase 3 — Persistent Memory Storage
+
+## Overview
+
+Phase 3 introduces persistent storage for the Cognitive Memory system.
+
+Phase 1 established the canonical memory foundation, and Phase 2 introduced memory formation and lifecycle decisions. Phase 3 makes the resulting memories and their domain-event history durable across application restarts.
+
+The implementation provides:
+
+- Content-addressed evidence storage.
+- Evidence metadata registration.
+- Canonical memory persistence.
+- Version-controlled memory updates.
+- Durable domain-event history.
+- Atomic SQLite persistence of memories and their corresponding events.
+- A persistent service interface for memory operations.
+
+## Architecture
+
+The Phase 3 storage architecture consists of the following components:
+
+```text
+                 Memory Operations
+                        |
+                        v
+              PersistentMemoryService
+                        |
+             +----------+----------+
+             |                     |
+             v                     v
+    JSON-backed Storage      SQLite Storage
+             |                     |
+       +-----+------+        +-----+------+
+       |            |        |            |
+       v            v        v            v
+ Canonical       Domain   Canonical    Domain
+ Memory          Event    Memory       Event
+ Repository      Store    Records      Records
+```
+
+Evidence storage is provided separately through the object store and evidence registry.
+
+### 1. Object Store
+
+**File:** `src/memory_engine/storage/object_store.py`
+
+The object store preserves evidence content independently of canonical memory records.
+
+Responsibilities:
+
+- Store content using its SHA-256 content hash.
+- Avoid storing duplicate content objects.
+- Verify content integrity when reading stored objects.
+- Use atomic filesystem operations when creating objects.
+
+Content-addressed storage allows evidence content to be referenced by its hash rather than duplicated across memory records.
+
+### 2. Evidence Registry
+
+**File:** `src/memory_engine/storage/evidence_registry.py`
+
+The evidence registry stores metadata associated with evidence and connects that metadata to the object store.
+
+Responsibilities:
+
+- Register evidence metadata.
+- Persist registry information.
+- Retrieve registered evidence.
+- Deduplicate evidence using content hashes.
+
+**Implementation note:** The current registry deduplicates identical content hashes. Consequently, identical content does not necessarily preserve multiple independent provenance records.
+
+### 3. Canonical Memory Repository
+
+**File:** `src/memory_engine/storage/canonical_repository.py`
+
+The JSON-backed canonical repository persists the authoritative memory records.
+
+Responsibilities:
+
+- Create and retrieve memories.
+- List stored memories.
+- Update existing memories.
+- Preserve memory metadata, evidence references, status, and version.
+- Reject updates that use a stale expected version.
+- Write repository changes using atomic file replacement.
+
+The canonical repository provides a filesystem-backed persistence option.
+
+Its locking is process-local; it should not be treated as a multi-process transactional database.
+
+### 4. Domain Event Store
+
+**File:** `src/memory_engine/storage/domain_event_store.py`
+
+The domain event store preserves the history of memory operations.
+
+Events include:
+
+- `memory.created`
+- `memory.updated`
+- `memory.superseded`
+- `memory.archived`
+- `memory.reinforced`
+- `memory.relationship_created`
+
+Responsibilities:
+
+- Append domain events.
+- Append multiple events.
+- Retrieve the complete event history.
+- Retrieve events associated with a particular memory.
+- Reject duplicate event identifiers.
+- Persist event records across restarts.
+
+The JSON event store uses atomic file replacement. However, a JSON canonical-memory write and a separate JSON event-store write are not one shared transaction.
+
+### 5. SQLite Memory Repository
+
+**File:** `src/memory_engine/storage/sqlite_memory_repository.py`
+
+The SQLite repository provides transactional persistence for canonical memories and domain events.
+
+It stores:
+
+- Canonical memory records.
+- Memory versions.
+- Domain event records.
+- Event metadata and timestamps.
+
+The repository supports:
+
+- Atomic memory creation and creation-event insertion.
+- Atomic memory updates and event insertion.
+- Atomic superseding and archiving transitions.
+- Expected-version validation.
+- Rollback when a transactional operation fails.
+- Retrieval of memories and their event histories after reopening the database.
+
+SQLite transactions ensure that a memory mutation and its corresponding domain event are committed together or rolled back together.
+
+The repository enables SQLite-backed persistence without requiring the JSON repository and JSON event store to perform separate writes.
+
+### 6. Persistent Memory Service
+
+**File:** `src/memory_engine/storage/persistent_memory_service.py`
+
+The persistent service exposes a common interface for memory operations.
+
+Supported operations:
+
+| Operation | Description |
+|---|---|
+| `create()` | Persist a memory and its creation event |
+| `get()` | Retrieve a memory by identifier |
+| `list_memories()` | Retrieve canonical memories |
+| `update()` | Update a memory using expected-version validation |
+| `supersede()` | Mark a memory as superseded |
+| `archive()` | Archive a memory |
+| `list_events()` | Retrieve durable domain events |
+| `list_events_for_memory()` | Retrieve events associated with one memory |
+
+The service supports both JSON-backed storage and SQLite-backed storage.
+
+When using SQLite, memory mutations and their corresponding domain events are persisted transactionally.
+
+When using JSON-backed storage, the canonical repository and event store remain separate persistence components.
+
+## Memory Lifecycle and Versioning
+
+The persistent service supports the following lifecycle operations:
+
+- Creation of a new memory.
+- Updates to an existing memory.
+- Superseding an existing memory.
+- Archiving a memory.
+
+Updates and lifecycle transitions use expected-version validation to detect stale writes.
+
+A successful versioned mutation increments the memory version.
+
+SQLite-backed lifecycle mutations persist the updated memory and its domain event in the same transaction.
+
+## Recovery After Restart
+
+The persistent service restores existing canonical memories when it is initialized.
+
+For SQLite-backed storage, canonical memories and domain events are read from the same database.
+
+This allows the service to recover its persisted memory state and event history after reconstruction.
+
+## Testing and Validation
+
+Phase 3 tests cover:
+
+- Evidence object storage.
+- Evidence registry behavior.
+- Canonical memory persistence.
+- Persistent service operations.
+- Memory lifecycle transitions.
+- Domain-event persistence.
+- SQLite repository creation and updates.
+- Stale-version rejection.
+- Transaction rollback.
+- Service recovery after restart.
+- SQLite-backed creation, updates, superseding, and archiving.
+
+### Test results
+
+Latest reported results:
+
+- **Phase 3 tests:** 36 passed.
+- **Complete test suite:** 76 passed.
+
+Run the Phase 3 tests:
+
+```bash
+python -m pytest tests/phase3 -v
+```
+
+Run the complete test suite:
+
+```bash
+python -m pytest -q
+```
+
+## Phase 3 Scope
+
+Phase 3 establishes the persistence foundation for the Cognitive Memory system.
+
+It provides durable evidence storage, canonical memory persistence, version-controlled mutations, domain-event history, and a transactional SQLite implementation.
+
+The JSON-backed storage components remain available as an alternative implementation.
+
+This phase does not, by itself, establish that every storage component is connected to an external vector database or graph database. Those integrations should be documented when implemented and tested.
+
 ## Development Philosophy
 
 The project follows several architectural principles:
